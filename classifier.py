@@ -41,7 +41,7 @@ log = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))  # Groq free: 30 RPM / 6k TPM
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "2.0"))  # seconds between request starts
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "5.0"))  # seconds between request starts
 MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 INPUT_CSV = Path(os.getenv("INPUT_CSV", "input_requests.csv"))
 OUTPUT_JSON = Path(os.getenv("OUTPUT_JSON", "output.json"))
@@ -191,22 +191,27 @@ async def classify_one(
 
 
 async def classify_all(rows: list[dict[str, str]]) -> list[ClassifiedRequest]:
-    """Classify all rows with staggered starts to respect Groq rate limits."""
+    """Classify all rows sequentially with delays to respect Groq rate limits."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         log.error("GROQ_API_KEY not set. Add it to .env or environment.")
         sys.exit(1)
 
     client = AsyncGroq(api_key=api_key)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-
-    async def staggered(i: int, row: dict[str, str]) -> ClassifiedRequest:
-        await asyncio.sleep(i * REQUEST_DELAY)
-        return await classify_one(client, row, semaphore)
-
-    tasks = [staggered(i, row) for i, row in enumerate(rows)]
-    results = await asyncio.gather(*tasks)
-    return list(results)
+    results = []
+    
+    for i, row in enumerate(rows):
+        request_id = row.get("id", "?")
+        log.info(f"[{request_id}] Processing ({i+1}/{len(rows)})...")
+        
+        if i > 0:
+            await asyncio.sleep(REQUEST_DELAY)
+        
+        semaphore = asyncio.Semaphore(1)
+        result = await classify_one(client, row, semaphore)
+        results.append(result)
+    
+    return results
 
 
 # ──────────────────────────────────────────────
