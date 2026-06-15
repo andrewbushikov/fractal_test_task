@@ -18,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import aiohttp
+import gspread
+from google.oauth2.service_account import Credentials
 from groq import AsyncGroq, RateLimitError, APIError
 from dotenv import load_dotenv
 from pydantic import ValidationError
@@ -43,6 +46,11 @@ MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 INPUT_CSV = Path(os.getenv("INPUT_CSV", "input_requests.csv"))
 OUTPUT_JSON = Path(os.getenv("OUTPUT_JSON", "output.json"))
 OUTPUT_REPORT = Path(os.getenv("OUTPUT_REPORT", "report.md"))
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Sheet1")
+SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "service_account.json")
 
 SYSTEM_PROMPT = """Ти — класифікатор вхідних запитів для AI-юніту компанії.
 Твоє завдання: проаналізувати текст запиту і повернути ВИКЛЮЧНО валідний JSON (без будь-якого тексту до або після).
@@ -307,6 +315,130 @@ def write_report(results: list[ClassifiedRequest], path: Path) -> None:
     log.info(f"Report written to {path}")
 
 
+
+# ──────────────────────────────────────────────
+# Google Sheets export
+# ──────────────────────────────────────────────
+
+SHEET_HEADERS = [
+    "ID", "Канал", "Час", "Категорія", "Відділ", "Пріоритет",
+    "Суть", "Дії", "Потребує уточнення", "Питання", "Складність",
+    "Тональність", "Впевненість", "Текст запиту",
+]
+
+
+def write_google_sheet(results: list[ClassifiedRequest]) -> None:
+    """Append classified results to an existing Google Sheet."""
+    if not SPREADSHEET_ID:
+        log.warning("SPREADSHEET_ID not set — skipping Google Sheets export.")
+        return
+
+    sa_path = Path(SERVICE_ACCOUNT_JSON)
+    if not sa_path.exists():
+        log.error(f"Service account file not found: {sa_path}")
+        return
+
+    try:
+        creds = Credentials.from_service_account_file(
+            str(sa_path),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        ws = sh.worksheet(SHEET_NAME)
+
+        # Write headers if sheet is empty
+        if ws.row_count == 0 or not ws.row_values(1):
+            ws.append_row(SHEET_HEADERS, value_input_option="RAW")
+
+        rows = []
+        for r in results:
+            rows.append([
+                r.request_id,
+                r.channel,
+                r.timestamp,
+                r.category.value,
+                r.target_department or "",
+                r.priority.value,
+                r.short_summary,
+                "; ".join(r.requested_actions),
+                "Так" if r.needs_clarification else "Ні",
+                r.clarification_question or "",
+                r.estimated_complexity or "",
+                r.sentiment or "",
+                r.llm_confidence or "",
+                r.raw_text,
+            ])
+
+        ws.append_rows(rows, value_input_option="RAW")
+        log.info(f"Written {len(rows)} rows to Google Sheet '{SHEET_NAME}'.")
+
+    except gspread.exceptions.SpreadsheetNotFound:
+        log.error(f"Spreadsheet not found: {SPREADSHEET_ID}. Check ID and sharing settings.")
+    except gspread.exceptions.WorksheetNotFound:
+        log.error(f"Worksheet '{SHEET_NAME}' not found. Check GOOGLE_SHEET_NAME.")
+    except Exception as e:
+        log.error(f"Google Sheets error: {e}")
+
+
+# ──────────────────────────────────────────────
+# Telegram digest
+# ──────────────────────────────────────────────
+
+def build_digest(results: list[ClassifiedRequest]) -> str:
+    """Build a short digest message for Telegram."""
+    total = len(results)
+    by_cat: dict[str, int] = {}
+    by_prio: dict[str, int] = {}
+    needs_clarification = []
+
+    for r in results:
+        by_cat[r.category.value] = by_cat.get(r.category.value, 0) + 1
+        by_prio[r.priority.value] = by_prio.get(r.priority.value, 0) + 1
+        if r.needs_clarification:
+            needs_clarification.append(r)
+
+    prio_icons = {"high": "🔴", "medium": "🟡", "low": "🟢"}
+
+    lines = [
+        "📬 *AI Inbox — дайджест*",
+        f"Оброблено запитів: *{total}*",
+        "",
+        "*По категоріях:*",
+    ]
+    for cat, count in sorted(by_cat.items(), key=lambda x: -x[1]):
+        lines.append(f"  • {cat}: {count}")
+
+    lines += ["", "*По пріоритету:*"]
+    for prio in ["high", "medium", "low"]:
+        count = by_prio.get(prio, 0)
+        lines.append(f"  {prio_icons[prio]} {prio}: {count}")
+
+    if needs_clarification:
+        lines += ["", f"*Потребують уточнення ({len(needs_clarification)}):*"]
+        for r in needs_clarification:
+            lines.append(f"  ❓ {r.request_id} — {r.short_summary[:60]}")
+
+    return "\n".join(lines)
+
+
+async def send_telegram(text: str) -> None:
+    """Send message to Telegram channel via Bot API."""
+    if not TG_TOKEN or not TG_CHAT_ID:
+        log.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHANNEL_ID not set — skipping Telegram.")
+        return
+
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "Markdown"}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            if resp.status == 200:
+                log.info("Telegram digest sent successfully.")
+            else:
+                body = await resp.text()
+                log.error(f"Telegram error {resp.status}: {body}")
+
 # ──────────────────────────────────────────────
 # Entrypoint
 # ──────────────────────────────────────────────
@@ -317,6 +449,9 @@ async def main() -> None:
     results = await classify_all(rows)
     write_json(results, OUTPUT_JSON)
     write_report(results, OUTPUT_REPORT)
+    write_google_sheet(results)
+    digest = build_digest(results)
+    await send_telegram(digest)
     log.info("=== Done ===")
 
 
